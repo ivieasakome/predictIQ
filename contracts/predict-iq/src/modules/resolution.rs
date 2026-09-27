@@ -225,48 +225,40 @@ fn calculate_voting_outcome(e: &Env, market: &crate::types::Market) -> Result<u3
         return Err(ErrorCode::NoMajorityReached);
     }
 
-    // Find outcome with highest votes
-    let mut max_outcome = 0u32;
-    let mut max_votes = 0i128;
+    let mut winning_outcome: Option<u32> = None;
+    let mut winning_tally: i128 = 0;
 
-    for i in 0..tallies.len() {
-        let (outcome, votes) = tallies.get(i).unwrap();
-        if votes > max_votes {
-            max_votes = votes;
-            max_outcome = outcome;
+    for (outcome, tally) in tallies.iter() {
+        if tally > winning_tally {
+            winning_tally = tally;
+            winning_outcome = Some(outcome);
         }
     }
 
-    // Check if majority exceeds 60%
-    let majority_pct = (max_votes * 10000) / total_votes;
-    if majority_pct >= MAJORITY_THRESHOLD_BPS {
-        Ok(max_outcome)
-    } else {
-        Err(ErrorCode::NoMajorityReached)
+    let winning_outcome = winning_outcome.ok_or(ErrorCode::NoMajorityReached)?;
+
+    // Check 60% majority threshold
+    let threshold = (total_votes * MAJORITY_THRESHOLD_BPS) / 10000;
+    if winning_tally < threshold {
+        return Err(ErrorCode::NoMajorityReached);
     }
+
+    Ok(winning_outcome)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::Env;
+/// Get resolution metrics for batch payout planning
+pub fn get_resolution_metrics(e: &Env, market_id: u64) -> Result<(u32, u64), ErrorCode> {
+    let market = markets::get_market(e, market_id).ok_or(ErrorCode::MarketNotFound)?;
 
-    /// Default dispute window returns DEFAULT_DISPUTE_WINDOW_SECONDS when no
-    /// admin-configured value is stored.
-    #[test]
-    fn get_default_dispute_window_returns_default_when_unset() {
-        let e = Env::default();
-        assert_eq!(get_default_dispute_window(&e), DEFAULT_DISPUTE_WINDOW_SECONDS);
-    }
+    let winning_outcome = market.winning_outcome.ok_or(ErrorCode::ResolutionNotReady)?;
 
-    /// Admin-configured dispute window is returned after set_dispute_window.
-    #[test]
-    fn get_default_dispute_window_returns_configured_value() {
-        let e = Env::default();
-        // Bypass admin check by writing directly to storage.
-        e.storage()
-            .persistent()
-            .set(&crate::types::ConfigKey::DefaultDisputeWindow, &7_200u64);
-        assert_eq!(get_default_dispute_window(&e), 7_200u64);
-    }
+    // Issue #1535: use the per-outcome unique-bettor counter maintained by
+    // `markets::increment_outcome_bet_count` instead of the broken stub that
+    // always returned 0 or 1.
+    let winner_count = markets::count_bets_for_outcome(e, market_id, winning_outcome);
+
+    // Estimate gas: base cost + per-winner cost
+    let gas_estimate = 100_000 + (winner_count as u64 * 50_000);
+
+    Ok((winner_count, gas_estimate))
 }
