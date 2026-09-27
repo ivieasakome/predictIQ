@@ -64,6 +64,13 @@ pub fn execute_migration(
 
             // Record successful migration
             record_migration(e, from_version, to_version)?;
+
+            // Clean up the backup snapshot now that the migration has succeeded.
+            // Without this, every successful migration leaks an orphaned
+            // `MigrationBackup` entry in persistent storage forever.
+            let backup_key = format!("migration:backup:v{}", from_version);
+            e.storage().persistent().remove(&backup_key);
+
             Ok(())
         }
         Err(err) => {
@@ -261,7 +268,9 @@ mod tests {
         // a genuine rollback of both snapshotted keys -- not just marker cleanup.
         let tampered_guardians: Vec<Guardian> = Vec::new(&env);
         let result = execute_migration(&env, 1, 2, |_e| {
-            _e.storage().persistent().remove(&ConfigKey::Admin);
+            _e.storage()
+                .persistent()
+                .remove(&ConfigKey::Admin);
             _e.storage()
                 .persistent()
                 .set(&ConfigKey::GuardianSet, &tampered_guardians);
@@ -270,10 +279,12 @@ mod tests {
 
         assert_eq!(result, Err(ErrorCode::MigrationValidationError));
         // Both keys must be genuinely restored to their pre-migration values.
-        assert_eq!(
-            env.storage().persistent().get::<ConfigKey, Address>(&ConfigKey::Admin),
-            Some(admin)
-        );
+        let restored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&ConfigKey::Admin)
+            .expect("admin should be restored");
+        assert_eq!(restored_admin, admin);
         assert_eq!(
             env.storage()
                 .persistent()
@@ -317,5 +328,37 @@ mod tests {
 
         // The earlier entry must not have been overwritten by the later one.
         assert_ne!(first.to_version, second.to_version);
+
+        // The backup snapshot must be cleaned up on the rollback path.
+        let backup_key = format!("migration:backup:v{}", 1);
+        assert!(!env.storage().persistent().has(&backup_key));
+    }
+
+    #[test]
+    fn test_successful_migration_removes_backup_snapshot() {
+        use soroban_sdk::Address;
+
+        let env = soroban_sdk::Env::default();
+        let admin = Address::generate(&env);
+        let guardians = Vec::from_array(
+            &env,
+            [Guardian {
+                address: Address::generate(&env),
+                voting_power: 1,
+            }],
+        );
+
+        env.storage().persistent().set(&ConfigKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .set(&ConfigKey::GuardianSet, &guardians);
+
+        // A migration that leaves the validated invariants intact succeeds.
+        let result = execute_migration(&env, 1, 2, |_e| Ok(()));
+        assert_eq!(result, Ok(()));
+
+        // The backup snapshot must not be left orphaned in persistent storage.
+        let backup_key = format!("migration:backup:v{}", 1);
+        assert!(!env.storage().persistent().has(&backup_key));
     }
 }
